@@ -60,6 +60,7 @@ integer mode;
 
 list restrictions; // restrictions currently applied (without the "=n" part)
 key source;        // UUID of the object I'm commanded by, always equal to NULL_KEY if restrictions is empty, always set if not
+key controller;    // UUID of the person controlling the object, if passed to us by the !who command
 
 string pendingName; // name of initiator of pending request (first request of a session in mode 1)
 key pendingId;      // UUID of initiator of pending request (first request of a session in mode 1)
@@ -572,16 +573,16 @@ executeMetaCommand(string cmd_id, string id, string command)
     {
         loginWaitingForPong = FALSE;
     }
-    elser if (command == PREFIX_METACOMMAND + "who")
+    else if (llGetSubString(command,0,4) == "!who/")
     {
-        kController = (key)llGetSubString(command, 5, -1);
+        controller = (key)llGetSubString(command, 5, -1);
     }
-    else if (command == PREFIX_METACOMMAND + "handover")
+    else if (llGetSubString(command,0,9) == "!handover/")
     {
         list tokens = llParseString2List(command, ["/"], []);
         if(!llList2Integer(tokens, 2))
             releaseRestrictions();
-        kSource = llList2Key(tokens,1);
+        source = llList2Key(tokens,1);
         pingWorldObjectIfUnderRestrictions();
     }
 }
@@ -635,6 +636,7 @@ removeFromPendingList(string behav)
 // lift all the restrictions (called by !release and by turning the relay off)
 releaseRestrictions()
 {
+    ack("Relay Release Notification", source, "!release", "ok");
     source = NULL_KEY;
     integer i;
     integer len = llGetListLength (restrictions);
@@ -645,8 +647,10 @@ releaseRestrictions()
     sendRLCmd(RVL_COMMAND_END);
     lastForceSitDestination = NULL_KEY;
     restrictions = [];
+    ack("Relay Release Notification", pendingId, "!release", "ok");
     loginPendingForceSit = FALSE;
     clearPendingMessages();
+    controller = NULL_KEY;
     llMessageLinked(LINK_SET, STATUS_LINK_CHANNEL, "release", NULL_KEY);
 }
 
