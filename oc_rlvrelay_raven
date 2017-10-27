@@ -1,0 +1,999 @@
+//~ RestrainedLife Viewer Relay Script example code
+//~ By Marine Kelley, Maike Short, Felis Darwin
+//~ Thanks to Chorazin Allen, Azoth Amat, Gregor Mougin, Nano Siemens, Cerdita Piek
+
+//~ This code is provided AS-IS, OPEN-SOURCE and holds NO WARRANTY of accuracy,
+//~ completeness or performance. It may only be distributed in its full source code,
+//~ this header and disclaimer and is not to be sold.
+
+integer DEBUG = FALSE;
+
+// make cheating (adding exceptions) a bit more difficult by not allowing
+// attachment to control the viewer as they are not subjected to land building
+// restrictions
+integer ALLOW_CONTROL_BY_ATTACHMENTS = TRUE;
+
+
+// list of refused commands. Use [] to allow everything or
+// ["@detach", "@remoutfit"] to prevent striping for example
+list refusedForceCommands = [];
+
+// ---------------------------------------------------
+//                     Constants
+// ---------------------------------------------------
+
+integer RLVRS_PROTOCOL_VERSION = 1100; // version of the protocol, stated on the specification page
+string RLVRS_IMPL_VERSION = "Ravens Restraints Relay 1.0"; // version of the implementation for debugging
+
+string PREFIX_RL_COMMAND = "@";
+string PREFIX_METACOMMAND = "!";
+
+integer RLVRS_CHANNEL = -1812221819;  // RLVRS in numbers
+integer DIALOG_CHANNEL = -1812220409; // RLVDI in numbers
+integer STATUS_LINK_CHANNEL = -1373421300;
+integer RLV_LINK_CHANNEL = -1373421301;
+integer CMD_LINK_CHANNEL = -1373421302;
+integer DIALOG_LINK_CHANNEL = -1373421303;
+integer ASK_LINK_CHANNEL = -1373421304;
+
+integer MAX_OBJECT_DISTANCE = 100;     // 20m is llSay distance
+integer MAX_TIME_AUTOACCEPT_AFTER_FORCESIT = 5; // seconds
+
+integer PERMISSION_DIALOG_TIMEOUT = 30;
+integer LOGIN_DELAY_WAIT_FOR_PONG = 10;
+integer LOGIN_DELAY_WAIT_FOR_FORCE_SIT = 60;
+
+integer MODE_OFF = 0;
+integer MODE_ASK = 1;
+integer MODE_AUTO = 2;
+
+//list MODE_DESCRIPTIONS = ["RLV Relay is OFF", "RLV Relay is ON (permission needed)", "RLV Relay is ON (auto-accept)"];
+list MODE_DESCRIPTIONS = ["RLV Relay is OFF", "RLV Relay is ON (Auto Raven's House, Ask everone else)", "RLV Relay is ON (auto-accept)"];
+string RVL_COMMAND_START = "@this-is-a-script-generated-message-beyond-the-control-of-the-agent=n,detach=n";
+string RVL_COMMAND_END = "@detach=y";
+
+// ---------------------------------------------------
+//                      Variables
+// ---------------------------------------------------
+
+integer mode;
+
+list restrictions; // restrictions currently applied (without the "=n" part)
+key source;        // UUID of the object I'm commanded by, always equal to NULL_KEY if restrictions is empty, always set if not
+
+string pendingName; // name of initiator of pending request (first request of a session in mode 1)
+key pendingId;      // UUID of initiator of pending request (first request of a session in mode 1)
+string pendingMessage; // message of pending request
+integer pendingTime;
+
+// used on login
+integer timerTickCounter; // count the number of time events on login (forceSit has to be delayed a bit)
+integer loginWaitingForPong;
+integer loginPendingForceSit;
+
+key     lastForceSitDestination;
+integer lastForceSitTime;
+
+integer isNotEmbedded = TRUE;
+
+// ---------------------------------------------------
+//               Helper functions
+// ---------------------------------------------------
+
+
+debug(string x)
+{
+    if (DEBUG)
+    {
+        llOwnerSay("DEBUG: " + x);
+    }
+}
+
+// checks whether this object is an attachment of an avatar
+integer isAttachment(key id)
+{
+    vector objpos1 = llList2Vector(llGetObjectDetails(id, [OBJECT_POS]), 0);
+    vector ownerpos = llList2Vector(llGetObjectDetails(llGetOwnerKey(id), [OBJECT_POS]), 0);
+    vector objpos2 = llList2Vector(llGetObjectDetails(id, [OBJECT_POS]), 0);
+    return (llVecMag(objpos1 - ownerpos) <= llVecMag(objpos1 - objpos2));
+}
+
+
+// ---------------------------------------------------
+//               Low Level Communication
+// ---------------------------------------------------
+
+
+// acknowledge or reject
+ack(string cmd_id, key id, string cmd, string ack)
+{
+    llShout(RLVRS_CHANNEL, cmd_id + "," + (string)id + "," + cmd + "," + ack);
+}
+
+// cmd begins with a '@'
+sendRLCmd(string cmd)
+{
+    if (cmd != "")
+    {
+        if (isNotEmbedded)
+        {
+            llOwnerSay(cmd);
+        }
+        llMessageLinked(LINK_SET, RLV_LINK_CHANNEL, cmd, source);
+    }
+}
+
+
+// check that this command is for us and not someone else
+integer verifyWeAreTarget(string message)
+{
+    list tokens = llParseString2List(message, [","], []);
+    if (llGetListLength(tokens) != 3) // this is not a normal command
+    {
+        return FALSE;
+    }
+
+    return (llList2String(tokens, 1) == llGetOwner()); // talking to me ?
+}
+
+// checks that the type of object (world object, attachment) is allowed
+integer verifySourceType(key id)
+{
+    if (ALLOW_CONTROL_BY_ATTACHMENTS)
+    {
+        return TRUE;
+    }
+
+    return !isAttachment(id);
+}
+
+// ---------------------------------------------------
+//               Permission Handling
+// ---------------------------------------------------
+
+
+// are we already under command by this object?
+integer isObjectKnow(key id)
+{
+    // are we already under command by this object?
+    if (source == id)
+    {
+        return TRUE;
+    }
+
+    // are we not under command by any object but were we forced to sit on this object recently?
+    if ((source == NULL_KEY) && (id == lastForceSitDestination))
+    {
+        debug("on last force sit target");
+        if (lastForceSitTime + MAX_TIME_AUTOACCEPT_AFTER_FORCESIT > llGetUnixTime())
+        {
+            debug("and recent enough to auto accept");
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+
+// check whether the object is in llSay distance.
+// The specification requires llSay instead of llShout or llRegionSay
+// to be used to limit the range. But this has to be checked here again
+// because the objects are not trustworthy.
+integer isObjectNear(key id)
+{
+    vector myPosition = llGetRootPosition();
+    list temp = llGetObjectDetails(id, ([OBJECT_POS]));
+    vector objPostition = llList2Vector(temp,0);
+    float distance = llVecDist(objPostition, myPosition);
+    return distance <= MAX_OBJECT_DISTANCE;
+}
+
+// do a basic check on the identity of the object trying to issue a command
+integer isObjectIdentityTrustworthy(key id)
+{
+    key parcel_owner=llList2Key (llGetParcelDetails (llGetPos (), [PARCEL_DETAILS_OWNER]), 0);
+    key parcel_group=llList2Key (llGetParcelDetails (llGetPos (), [PARCEL_DETAILS_GROUP]), 0);
+    key object_owner=llGetOwnerKey(id);
+    key object_group=llList2Key (llGetObjectDetails (id, [OBJECT_GROUP]), 0);
+
+    debug("owner= " + (string) parcel_owner + " / " + (string) object_owner);
+    debug("group= " + (string) parcel_group + " / " + (string) object_group);
+
+    if (object_owner==llGetOwner ()        // IF I am the owner of the object
+      || object_owner==parcel_owner        // OR its owner is the same as the parcel I'm on
+      || object_group==parcel_group        // OR its group is the same as the parcel I'm on
+    )
+    {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+
+// Is this a simple request for information or a meta command like !release?
+integer isSimpleRequest(list list_of_commands)
+{
+    integer len = llGetListLength(list_of_commands);
+    integer i;
+
+    // now check every single atomic command
+    for (i=0; i < len; ++i)
+    {
+        string command = llList2String(list_of_commands, i);
+        if (!isSimpleAtomicCommand(command))
+        {
+           return FALSE;
+        }
+    }
+
+    // all atomic commands passed the test
+    return TRUE;
+}
+
+// is this a simple atomar command
+// (a command which only queries some information or releases restrictions)
+// (e. g.: cmd ends with "=" and a number (@version, @getoutfit, @getattach) or is a !-meta-command)
+integer isSimpleAtomicCommand(string cmd)
+{
+    // check right hand side of the "=" - sign
+    integer index = llSubStringIndex (cmd, "=");
+    if (index > -1) // there is a "="
+    {
+        // check for a number after the "="
+        string param = llGetSubString (cmd, index + 1, -1);
+        if ((integer)param!=0 || param=="0") // is it an integer (channel number)?
+        {
+            return TRUE;
+        }
+
+        // removing restriction
+        if ((param == "y") || (param == "rem"))
+        {
+            return TRUE;
+        }
+    }
+
+    // check for a leading ! (meta command)
+    if (llSubStringIndex(cmd, PREFIX_METACOMMAND) == 0)
+    {
+        return TRUE;
+    }
+
+    // check for @clear
+    // Note: @clear MUST NOT be used because the restrictions will be reapplied on next login
+    // (but we need this check here because "!release|@clear" is a BROKEN attempt to work around
+    // a bug in the first relay implementation. You should refuse to use relay versions < 1013
+    // instead.)
+    if (cmd == "@clear")
+    {
+        return TRUE;
+    }
+
+    // this one is not "simple".
+    return FALSE;
+}
+
+// If we already have commands from this object pending
+// because of a permission request dialog, just add the
+// new commands at the end.
+// Note: We use a timeout here because the player may
+// have "ignored" the dialog.
+integer tryToGluePendingCommands(key id, string commands)
+{
+    if (llStringLength(pendingMessage) > 4000)
+    {
+        llSay(0, llKey2Name(id) + " is flooding commands. Releasing restrictions.");
+        releaseRestrictions();
+        return TRUE;
+    }
+    if ((pendingId == id) && (pendingTime + PERMISSION_DIALOG_TIMEOUT > llGetUnixTime()))
+    {
+        debug("Gluing " + (string) pendingMessage + " with " + commands);
+        pendingMessage = pendingMessage + "|" + commands;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+
+// accept !release even if out of range
+handleCommandsWhichAreAcceptedOutOfRange(key id, string message)
+{
+    if (id != source)
+    {
+        return;
+    }
+
+    list tokens = llParseString2List (message, [","], []);
+    if (llGetListLength (tokens) < 3)
+    {
+        return;
+    }
+    string commands = llList2String(tokens, 2);
+    list list_of_commands = llParseString2List(commands, ["|"], []);
+    if (llListFindList(list_of_commands, ["!release"]) > -1)
+    {
+        debug("accepted !release although it was out of range");
+        releaseRestrictions();
+    }
+}
+
+
+// verifies the permission. This includes mode
+// (off, permission, auto) of the relay and the
+// identity of the object (owned by parcel people).
+integer verifyPermission(key id, string name, string message)
+{
+    // is it switched off?
+    //if (mode == MODE_OFF)
+    //{
+    //    return FALSE;
+    //}
+
+    list tokens = llParseString2List (message, [","], []);
+    if (llGetListLength (tokens) < 3)
+    {
+        return FALSE;
+    }
+    string commands = llList2String(tokens, 2);
+    list list_of_commands = llParseString2List(commands, ["|"], []);
+
+    // if we are already having a pending permission-dialog request for THIS object,
+    // just add the new commands at the end of the pending command list.
+    if (tryToGluePendingCommands(id, commands))
+    {
+        return FALSE;
+    }
+
+    // accept harmless commands silently
+    if (isSimpleRequest(list_of_commands))
+    {
+        return TRUE;
+    }
+
+    // check whether this object belongs here
+    integer trustworthy = isObjectIdentityTrustworthy(id);
+    string warning = "";
+    if (!trustworthy)
+    {
+        warning = "\n\nWARNING: This object is not owned by the people owning this parcel. Unless you know the owner, you should deny this request.";
+    }
+    //Check if object is in Raven's House group
+    key parcel_group_raven=(key)"178c0a28-f91b-d63f-19b4-77fa70161b3d";
+    key object_group_test=llList2Key (llGetObjectDetails (id, [OBJECT_GROUP]), 0);
+
+    // ask in permission-request-mode and/OR in case the object identity is suspisous.
+    //if (mode == MODE_ASK || !trustworthy)
+    //Check if object is in Raven's House, if not ask permissions
+    if (object_group_test!=parcel_group_raven)
+    {
+        pendingId=id;
+        pendingName=name;
+        pendingMessage = message;
+        pendingTime = llGetUnixTime();
+        if (llKey2Name(llGetOwnerKey(id)) != "")
+        {
+            name += " (owned by " + llKey2Name(llGetOwnerKey(id)) + ")";
+        }
+
+        list temp = llGetObjectDetails(id, [OBJECT_POS]);
+        vector pos = llList2Vector(temp, 0);
+
+        string text = name
+            + " at <" + (string) ((integer) pos.x)
+            + ", " + (string) ((integer) pos.y)
+            + ", " + (string) ((integer) pos.z)
+            + "> (" + (string) ((integer) llVecDist(pos, llGetRootPosition())) + "m) "
+            + "would like to control your viewer." + warning + ".\n\nDo you accept ?";
+        debug("Asking for permission isNotEmbedded=" + (string) isNotEmbedded);
+        if (isNotEmbedded)
+        {
+            llDialog (llGetOwner(), text, ["Yes", "No"], DIALOG_CHANNEL);
+        }
+        llMessageLinked(LINK_SET, ASK_LINK_CHANNEL, text, id);
+        debug("Asking for permission");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+
+// ---------------------------------------------------
+//               Executing of commands
+// ---------------------------------------------------
+
+// execute a non-parsed message
+// this command could be denied here for policy reasons, (if it were implemenetd)
+// but this time there will be an acknowledgement
+execute(string name, key id, string message)
+{
+    list tokens = llParseString2List(message, [","], []);
+    string cmd_id = llList2String(tokens, 0); // CheckAttach
+    list list_of_commands = llParseString2List(llList2String(tokens, 2), ["|"], []);
+
+    integer len = llGetListLength (list_of_commands);
+    integer i;
+    string command;
+    string prefix;
+    for (i=0; i<len; ++i) // execute every command one by one
+    {
+        // a command is a RL command if it starts with '@' or a metacommand if it starts with '!'
+        command = llList2String(list_of_commands, i);
+        prefix = llGetSubString(command, 0, 0);
+
+        if (prefix == PREFIX_RL_COMMAND) // this is a RLV command
+        {
+            executeRLVCommand(cmd_id, id, command);
+        }
+        else if (prefix == PREFIX_METACOMMAND) // this is a metacommand, aimed at the relay itself
+        {
+            executeMetaCommand(cmd_id, id, command);
+        }
+    }
+}
+
+// executes a command for the restrained life viewer
+// with some additinal magic like book keeping
+executeRLVCommand(string cmd_id, string id, string command)
+{
+    command = llToLower(command);
+    // we need to know whether whether is a rule or a simple command
+    list tokens = llParseString2List(command, ["="], []);
+    string behav = llList2String(tokens, 0); // @getattach:skull
+    string param = llList2String(tokens, 1); // 2222
+    integer ind = llListFindList(restrictions, [behav]);
+
+    tokens = llParseString2List(behav, [":"], []); // @sit:<uuid>
+    string behavName = llList2String (tokens, 0);  // @sit
+    string option = llList2String (tokens, 1);     // <uuid>
+
+    debug("executeRLVCommand: behav=!" + behav + "! param=!" + param + "!");
+
+    //== Stop the public chat exploits, and disregard commands issued with no variable (clear is handled elsewhere)
+    if(param == nullstr || (~llSubStringIndex(behav, "@get") || ~llSubStringIndex(behav, "@findfolder") || ~llSubStringIndex(behav, "@version")) && ((integer)param <= 0))
+    {
+        ack(cmd_id, id, command, "ko");
+        return;
+    }
+
+    if (param=="n" || param=="add") // add to restrictions
+    {
+        if (ind < 0)
+        {
+            if (llGetListLength(restrictions) == 0)
+            {
+                sendRLCmd(RVL_COMMAND_START);
+                llMessageLinked(LINK_SET, STATUS_LINK_CHANNEL, "start", id);
+            }
+            restrictions += [behav];
+        }
+        source = id; // we know that source is either NULL_KEY or id already
+    }
+    else if (param == "y" || param == "rem") // remove from restrictions
+    {
+        if (ind > -1)
+        {
+            restrictions = llDeleteSubList (restrictions, ind, ind);
+        }
+        if (llGetListLength(restrictions) == 0)
+        {
+            source = NULL_KEY;
+            sendRLCmd(RVL_COMMAND_END);
+        }
+        removeFromPendingList(behav);
+    }
+    else if (param == "force")
+    {
+        if (llListFindList(refusedForceCommands, [behavName]) >= 0)
+        {
+            debug("rejected force-command: behav=!" + behav + "! behavName=!" + behavName + "!");
+            ack(cmd_id, id, command, "ko");
+            return;
+        }
+    }
+    else if ((integer) param == 0) {
+        // this is either an unknown param (not "n", "add", "y", "rem", "force")
+        // or a query which should be answered on the public chat channel 0.
+        ack(cmd_id, id, command, "ko");
+        return;
+    }
+
+    workaroundForAtClear(command);
+    rememberForceSit(behavName, option, param);
+    sendRLCmd(command); // execute command
+    ack(cmd_id, id, command, "ok"); // acknowledge
+}
+
+// check for @clear
+// Note: @clear MUST NOT be used because the restrictions will be reapplied on next login
+// (but we need this check here because "!release|@clear" is a BROKEN attempt to work around
+// a bug in the first relay implementation. You should refuse to use relay versions < 1013
+// instead.)
+workaroundForAtClear(string command)
+{
+    if (command == "@clear")
+    {
+        releaseRestrictions();
+        ack(cmd_id, id, command, "ok");
+    }
+}
+
+// remembers the time and object if this command is a force sit
+rememberForceSit(string behavName, string option, string param)
+{
+    // clear lastForceSitDestination in case we are now prevented from standing up and
+    // the force sit was long ago. Note: restrictions is checked to prevent the
+    // clearance in case @unsit is just send again on login
+    if (behavName == "@unsit")
+    {
+        if (llListFindList(restrictions, ["@unsit"]) < 0)
+        {
+            if (lastForceSitTime + MAX_TIME_AUTOACCEPT_AFTER_FORCESIT < llGetUnixTime())
+            {
+                debug("clearing lastForceSitDestination");
+                lastForceSitDestination = NULL_KEY;
+            }
+        }
+    }
+
+    if (param != "force")
+    {
+        return;
+    }
+
+    debug("'force'-command:" + behavName + "/" + option);
+    if (behavName != "@sit")
+    {
+        return;
+    }
+    lastForceSitDestination = (key) option;
+    lastForceSitTime = llGetUnixTime();
+    debug("remembered force sit");
+}
+
+// executes a meta command which is handled by the relay itself
+executeMetaCommand(string cmd_id, string id, string command)
+{
+    if (command == PREFIX_METACOMMAND + "version") // checking relay protocol version
+    {
+        ack(cmd_id, id, command, (string) RLVRS_PROTOCOL_VERSION);
+    }
+    else if (command == PREFIX_METACOMMAND + "implversion") // checking relay version
+    {
+        ack(cmd_id, id, command, RLVRS_IMPL_VERSION);
+    }
+    else if (command == PREFIX_METACOMMAND + "release") // release all the restrictions (end session)
+    {
+        releaseRestrictions();
+        ack(cmd_id, id, command, "ok");
+    }
+    else if (command == PREFIX_METACOMMAND + "pong")
+    {
+        loginWaitingForPong = FALSE;
+    }
+    elser if (command == PREFIX_METACOMMAND + "who")
+    {
+        kController = (key)llGetSubString(command, 5, -1);
+    }
+    else if (command == PREFIX_METACOMMAND + "handover")
+    {
+        list tokens = llParseString2List(command, ["/"], []);
+        if(!llList2Integer(tokens, 2))
+            releaseRestrictions();
+        kSource = llList2Key(tokens,1);
+        pingWorldObjectIfUnderRestrictions();
+    }
+}
+
+// removes a restriction from the list of pending commands
+removeFromPendingList(string behav)
+{
+    string search = behav + "=";
+
+    // don't do the expensive parsing (string operations are very slow in pre-
+    // mono LSL) in case we can detect fast that this one is not in the list.
+    if (llSubStringIndex(pendingMessage, search) < 0)
+    {
+        return;
+    }
+
+    list tokens = llParseString2List(pendingMessage, [","], []);
+    list commands = llParseString2List(llList2String(tokens, 2), ["|"], []);
+    integer modified = FALSE;
+
+    integer len = llGetListLength(commands);
+    integer i;
+    for (i = len - 1; i >= 0; i--)
+    {
+        string cmd = llList2String(commands, i);
+        if (llSubStringIndex(cmd, search) == 0)
+        {
+            if (llSubStringIndex(cmd, "=n") > -1 || llSubStringIndex(cmd, "=add") > -1)
+            {
+                commands = llDeleteSubList(commands, i, i);
+                modified = TRUE;
+            }
+        }
+    }
+
+    if (modified)
+    {
+        if (llGetListLength(commands) > 0)
+        {
+            pendingMessage = llList2String(tokens, 0) + "," + llList2String(tokens, 1) + "," + llDumpList2String(commands, "|");
+        }
+        else
+        {
+            clearPendingMessages();
+        }
+    }
+
+}
+
+
+// lift all the restrictions (called by !release and by turning the relay off)
+releaseRestrictions()
+{
+    source = NULL_KEY;
+    integer i;
+    integer len = llGetListLength (restrictions);
+    for (i = 0; i < len; ++i)
+    {
+        sendRLCmd(llList2String (restrictions, i) + "=y");
+    }
+    sendRLCmd(RVL_COMMAND_END);
+    lastForceSitDestination = NULL_KEY;
+    restrictions = [];
+    loginPendingForceSit = FALSE;
+    clearPendingMessages();
+    llMessageLinked(LINK_SET, STATUS_LINK_CHANNEL, "release", NULL_KEY);
+}
+
+
+// deletes the list of pending messsages
+clearPendingMessages()
+{
+    // clear pending request
+    pendingName = "";
+    pendingId = NULL_KEY;
+    pendingMessage = "";
+    pendingTime = 0;
+}
+
+
+// processes a message send on the relay channel
+processRelayMessage(string name, key id, string message)
+{
+    if (mode== MODE_OFF)
+    {
+        debug("deactivated - ignoring commands");
+        return; // mode is 0 (off) => reject
+    }
+
+    debug("LISTEN: " + message);
+
+    if (!verifyWeAreTarget(message))
+    {
+       return;
+    }
+
+    if (!verifySourceType(id))
+    {
+        return;
+    }
+
+    debug("Got message (active world object " + (string) source + "): name=" + name+ " id=" + (string) id + " message=" + message);
+
+    if (source)
+    {
+        if (source != id)
+        {
+            if (isObjectNear(source))
+            {
+                debug("already used by another object => reject");
+                return;
+            }
+            else
+            {
+                debug("already used by another object, which is out of range");
+                releaseRestrictions();
+            }
+        }
+    }
+
+    if (!isObjectNear(id))
+    {
+        handleCommandsWhichAreAcceptedOutOfRange(id, message);
+        return;
+    }
+
+    if (!isObjectKnow(id))
+    {
+        debug("asking for permission because source is NULL_KEY");
+        if (!verifyPermission(id, name, message))
+        {
+            return;
+        }
+    }
+
+    debug("Executing: " + (string) source);
+    execute(name, id, message);
+}
+
+// ---------------------------------------------------
+//            mode and dialog handling
+// ---------------------------------------------------
+
+
+
+// shows current mode as string
+showModeDescription()
+{
+    if (isNotEmbedded)
+    {
+        llOwnerSay(llList2String(MODE_DESCRIPTIONS, mode));
+    }
+    llMessageLinked(LINK_SET, STATUS_LINK_CHANNEL, "show_mode", (key) ((string) mode));
+}
+
+
+// process the Yes/No buttons of the permission dialog
+processDialogResponse(key id, string message)
+{
+    if (pendingId)
+    {
+        if (message == "Yes") // pending request authorized => process it
+        {
+            execute(pendingName, pendingId, pendingMessage);
+        }
+        clearPendingMessages();
+    }
+}
+
+
+
+// ---------------------------------------------------
+//            initialisation and login handling
+// ---------------------------------------------------
+
+init() {
+    sendRLCmd("@clear");
+    llOwnerSay("Waiting for plugins to initialize...");
+    llSleep(5);
+
+    mode = MODE_ASK;
+
+    llListen(RLVRS_CHANNEL, "", "", "");
+    llListen(DIALOG_CHANNEL, "", llGetOwner(), "");
+
+    if (llGetFreeMemory() < 10000)
+    {
+        llSay(0, llKey2Name(llGetOwner()) + ", your relay is having very little free script memory and is likly to crash during use. Please verify that it was compiled using Mono.");
+    }
+    llMessageLinked(LINK_SET, STATUS_LINK_CHANNEL, "init", NULL_KEY);
+
+    llOwnerSay("Initialized and ready");
+    debug("Free Memory: " + (string) llGetFreeMemory());
+}
+
+
+// sends the known restrictions (again) to the RL-viewer
+// (call this functions on login)
+reinforceKnownRestrictions()
+{
+    integer i;
+    integer len = llGetListLength(restrictions);
+    string restr;
+    debug("source=" + (string) source);
+    if (len > 0)
+    {
+        sendRLCmd(RVL_COMMAND_START);
+    }
+    for (i=0; i < len; ++i)
+    {
+        restr = llList2String(restrictions, i);
+        debug("restr=" + restr);
+        sendRLCmd(restr + "=n");
+        if (restr == "@unsit")
+        {
+            loginPendingForceSit = TRUE;
+        }
+    }
+}
+
+// send a ping request and start a timer
+pingWorldObjectIfUnderRestrictions()
+{
+    loginWaitingForPong = FALSE;
+    if (source)
+    {
+        ack("ping", source, "ping", "ping");
+        timerTickCounter = 0;
+        llSetTimerEvent(1.0);
+        loginWaitingForPong = TRUE;
+    }
+}
+
+sendForceSitDuringLogin()
+{
+    key sitTarget = source;
+    if (lastForceSitDestination)
+    {
+        sitTarget = lastForceSitDestination;
+    }
+    debug("Force sit during login on " + (string) sitTarget + " (source=" + (string) source + ", lastForceSitDestination=" + (string) lastForceSitDestination + ")");
+    sendRLCmd ("@sit:" + (string) sitTarget + "=force");
+}
+
+
+// processes a timer event
+processTimer()
+{
+    timerTickCounter++;
+    debug("timer (" + (string) timerTickCounter + "): waiting for pong: " + (string) loginWaitingForPong + " pendingForceSit: " + (string) loginPendingForceSit);
+    if (loginWaitingForPong && (timerTickCounter >= LOGIN_DELAY_WAIT_FOR_PONG))
+    {
+        llWhisper(0, "Lucky Day: " + llKey2Name(llGetOwner()) + " is freed because the device is not available.");
+        loginWaitingForPong = FALSE;
+        loginPendingForceSit = FALSE;
+        releaseRestrictions();
+    }
+
+    if (loginPendingForceSit)
+    {
+        integer agentInfo = llGetAgentInfo(llGetOwner());
+        if (agentInfo & AGENT_SITTING)
+        {
+            loginPendingForceSit = FALSE;
+            debug("is sitting now");
+        }
+        else if (timerTickCounter == LOGIN_DELAY_WAIT_FOR_FORCE_SIT)
+        {
+            llWhisper(0, "Lucky Day: " + llKey2Name(llGetOwner()) + " is freed because sitting down again was not possible.");
+            loginPendingForceSit = FALSE;
+            releaseRestrictions();
+        }
+        else
+        {
+            sendForceSitDuringLogin();
+        }
+    }
+
+    if (!loginPendingForceSit && !loginWaitingForPong)
+    {
+        llSetTimerEvent(0.0);
+    }
+}
+
+processLinkMessage(key id, string message)
+{
+    if (message == "safeword")
+    {
+        llSay(0, llKey2Name(llGetOwner()) + " said the safeword. Freeing and deactivating relay.");
+        releaseRestrictions();
+        mode = MODE_OFF;
+        showModeDescription();
+        return;
+    }
+
+    if (message == "unlock")
+    {
+        if (id)
+        {
+            llSay(0, llKey2Name(id) + " freed " + llKey2Name(llGetOwner()) + " by unlocking the relay.");
+        }
+        releaseRestrictions();
+        return;
+    }
+
+     if (message == "mode")
+     {
+         if (source)
+        {
+            llOwnerSay("Sorry, you cannot change the relay mode while it is active.");
+            return;
+        }
+         mode = ((integer) ((string) id)) % 3;
+        showModeDescription();
+        return;
+     }
+
+    if (message == "refusedForceCommands")
+    {
+        refusedForceCommands = llParseString2List((string) id, [","], []);
+        return;
+    }
+
+    if (message == "embedded")
+    {
+        isNotEmbedded = FALSE;
+        return;
+    }
+}
+
+
+default
+{
+    state_entry()
+    {
+        init();
+    }
+
+    on_rez(integer start_param)
+    {
+        // relogging, we must refresh the viewer and ping the object if any
+        // if mode is not OFF, fire all the stored restrictions
+        if (mode)
+        {
+            reinforceKnownRestrictions();
+            pingWorldObjectIfUnderRestrictions();
+        }
+        // remind the current mode to the user
+        showModeDescription();
+    }
+
+    timer()
+    {
+        processTimer();
+    }
+
+    listen(integer channel, string name, key id, string message)
+    {
+        if (channel==RLVRS_CHANNEL)
+        {
+            processRelayMessage(name, id, message);
+        }
+        else if (channel==DIALOG_CHANNEL)
+        {
+            processDialogResponse(id, message);
+        }
+    }
+
+    link_message(integer sender, integer channel, string message, key id)
+    {
+        if (channel == CMD_LINK_CHANNEL)
+        {
+            processLinkMessage(id, message);
+        }
+        else if (channel == DIALOG_LINK_CHANNEL)
+        {
+            processDialogResponse(id, message);
+        }
+    }
+
+    //touch_start(integer num_detected)
+    //{
+    //    if (!isNotEmbedded)
+    //    {
+    //        return;
+    //    }
+
+        // touched by user => cycle through OFF/ON_PERMISSION/ON_ALWAYS modes
+    //    key toucher = llDetectedKey(0);
+        //if (toucher != llGetOwner())
+    //    if (toucher != (key)"9a0ec3f4-a784-4d69-8c4d-fda5d249ccc9")
+    //    {
+    //        return;
+    //    }
+
+    //    if (source)
+    //    {
+    //        llOwnerSay("Sorry, you cannot change the relay mode while it is active.");
+    //        return;
+    //    }
+    //    mode = (mode + 1) % 3;
+    //    if (mode == MODE_OFF) {
+    //        releaseRestrictions();
+    //    }
+    //    showModeDescription();
+    //}
+
+    changed(integer change)
+    {
+        if (change & (CHANGED_OWNER | CHANGED_INVENTORY | CHANGED_ALLOWED_DROP))
+        {
+             llResetScript();
+        }
+    }
+}
